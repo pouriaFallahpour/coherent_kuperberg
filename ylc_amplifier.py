@@ -6,207 +6,241 @@ Yoder-Low-Chuang fixed-point amplitude amplification
    "Fixed-point quantum search with an optimal number of queries",
    Phys. Rev. Lett. 113, 210501 (2014).
 
-Given a pure state |Phi> = alpha|Good> + beta|Bad> and a unitary A|0...0> = |Phi>
-with |alpha| >= lambda_lower, this module amplifies |Good> to amplitude >= sqrt(1 - delta^2) 
-using L = O(log(1/delta) / lambda_lower) queries.  
-Unlike standard Grover, the success probability is monotone in L
-for *any* true alpha >= lambda_lower, so the protocol never overshoots.
+Setup
+-----
+We have an n-qubit state |Phi> = g|Good> + b|Bad>  (g^2 + b^2 = 1, real WLOG)
+and a known lower bound  g^2 >= lam.  Access:
 
-Define two reflections: S_A(phi) = I - (1 - e^{i phi}) A|0><0|A^dagger,
-and S_0(phi) = I - (1-e^{i phi}) |0...0><0...0|. The algorithm proceeds 
-by successively applying two reflections S_A(beta_j) S_0(alpha_j) for a list of
-beta_j's and alpha_j's where j iterates over [0,...,L-1].
-The expensive oracle is S_A(phi).
+    A          : n-qubit unitary,  A|0...0> = |Phi>
+    O_Good     : (n+1)-qubit oracle that XORs a Good-indicator into a 1-qubit
+                 ancilla:
+                     O_Good |Good>|b> = |Good>|b XOR 1>
+                     O_Good |Bad> |b> = |Bad> |b>
+
+Reflections (user-specified sign conventions):
+    S_s(alpha) = I - (1 - e^{-i alpha}) |Phi><Phi|
+    S_t(beta)  = I - (1 - e^{+i beta}) |Good><Good|
+
+Grover-like iterate:
+    G(alpha, beta) = - S_s(alpha) . S_t(beta)        (the leading - is global)
+
+Iteration count and schedule:
+    L = smallest odd integer strictly greater than  log(2/delta) / sqrt(lam)
+    l = (L - 1) / 2
+    1/gamma = cosh( arccosh(1/delta) / L )           (analytic continuation
+                                                      of  cos(arccos(.)/L) )
+    For j = 1, ..., l:
+        alpha_j = 2 * arccot( tan(2 pi j / L) * sqrt(1 - gamma^2) )
+        beta_j  = - alpha_{l - j + 1}
+
+Output S_L of l iterates, applied to the prepared state:
+    S_L = G(alpha_l, beta_l) ... G(alpha_1, beta_1)
+    |Psi> = S_L . (A tensor I_anc) . |0...0>_R |0>_anc
 """
 
 from __future__ import annotations
 import math
-from typing import Callable
 
 from qiskit import QuantumCircuit
 from qiskit.quantum_info import Statevector
 
-
-# ---------------------------------------------------------------------------
-# Helper: reflection-with-phase about |0...0>.
-# ---------------------------------------------------------------------------
-def _S0_reflection(n_qubits: int, phi: float) -> QuantumCircuit:
-    """
-    Build the unitary  S_0(phi) = I - (1 - e^{i phi}) |0...0><0...0|.
-
-    Strategy: bracket a multi-controlled phase gate (which fires only on
-    |11...1>) with X gates on every wire, mapping the all-zero state to
-    the all-one state and back.
-    """
-    qc = QuantumCircuit(n_qubits, name=f"S_0({phi:.3f})")
-    qc.x(range(n_qubits))
-    if n_qubits == 1:
-        qc.p(phi, 0)
-    else:
-        qc.mcp(phi, list(range(n_qubits - 1)), n_qubits - 1)
-    qc.x(range(n_qubits))
-    return qc
+from qiskit.qasm2 import dumps    # OpenQASM 2 (most readable, like the old .qasm())
 
 
 # ---------------------------------------------------------------------------
-# Helper: YLC phase schedule
+# Phase schedule  (l alpha's and l beta's, indexed 0..l-1 here = 1..l in spec)
 # ---------------------------------------------------------------------------
 def _ylc_phase_schedule(L: int, delta: float) -> tuple[list[float], list[float]]:
     """
-    Compute (alphas, betas), each of length L, for the YLC algorithm.
+    Compute (alphas, betas), each of length l = (L-1)//2.
 
-        gamma^{-1} = cosh( (1/L) * arccosh(1/delta) )            [Chebyshev]
-        alpha_j    = 2 * arccot( tan(2*pi*j/L) * sqrt(1 - gamma^2) )    [j=1..L]
-        beta_j     = -alpha_{L-j+1}
+        1/gamma = cosh( arccosh(1/delta) / L )
+        alpha_j = 2 * arccot( tan(2 pi j / L) * sqrt(1 - gamma^2) )   j = 1..l
+        beta_j  = - alpha_{l - j + 1}                                 j = 1..l
 
-    arccot is taken on the principal branch (0, pi):  arccot(x) = pi/2 - arctan(x).
+    arccot is the principal branch:  arccot(x) = pi/2 - arctan(x), in (0, pi).
     """
+    l = (L - 1) // 2
     gamma_inv = math.cosh(math.acosh(1.0 / delta) / L)
-    one_minus_gamma_sq = 1.0 - (1.0 / gamma_inv) ** 2
-    s = math.sqrt(max(0.0, one_minus_gamma_sq))
+    s = math.sqrt(max(0.0, 1.0 - (1.0 / gamma_inv) ** 2))   # sqrt(1 - gamma^2)
 
     alphas: list[float] = []
-    for j in range(1, L + 1):
+    for j in range(1, l + 1):
         x = math.tan(2.0 * math.pi * j / L) * s
-        alpha_j = 2.0 * (math.pi / 2.0 - math.atan(x))    # 2 * arccot(x)
+        alpha_j = 2.0 * (math.pi / 2.0 - math.atan(x))     # = 2 * arccot(x)
         alphas.append(alpha_j)
-    # beta_j = -alpha_{L-j+1}; in 0-indexed terms that's -alphas[L-j]
-    betas = [-alphas[L - j] for j in range(1, L + 1)]
+    betas = [-alphas[l - j] for j in range(1, l + 1)]      # beta_j = -alpha_{l-j+1}
     return alphas, betas
 
 
 # ---------------------------------------------------------------------------
-# Main: YLC fixed-point amplitude amplifier
+# Multi-qubit reflection-with-phase about |0...0>, in Qiskit's e^{+i theta} form
+#     S_0(theta) = I + (e^{+i theta} - 1) |0...0><0...0|
+# Used inside S_s, NOT as a separate exported subroutine.
+# ---------------------------------------------------------------------------
+def _apply_S0(qc: QuantumCircuit, theta: float, qubits: list[int]) -> None:
+    """In-place: append S_0(theta) on the given qubits of qc."""
+    qc.x(qubits)
+    if len(qubits) == 1:
+        qc.p(theta, qubits[0])
+    else:
+        qc.mcp(theta, qubits[:-1], qubits[-1])
+    qc.x(qubits)
+
+
+# ---------------------------------------------------------------------------
+# S_s(alpha) on the n-qubit state register:
+#     S_s(alpha) = A . S_0(-alpha) . A^dagger
+# because Qiskit's S_0 carries e^{+i theta} but the spec wants e^{-i alpha}
+# on |Phi>, so we pass -alpha.
+# ---------------------------------------------------------------------------
+def _apply_Ss(qc: QuantumCircuit, alpha: float,
+              R: list[int],
+              A_gate, A_inv_gate) -> None:
+    qc.append(A_inv_gate, R)
+    _apply_S0(qc, -alpha, R)
+    qc.append(A_gate, R)
+
+
+# ---------------------------------------------------------------------------
+# S_t(beta) on (R, ancilla):  e^{+i beta} phase on Good states.
+#     O_Good  .  p(+beta) on ancilla  .  O_Good
+# ---------------------------------------------------------------------------
+def _apply_St(qc: QuantumCircuit, beta: float,
+              R: list[int], a: int,
+              O_Good_gate) -> None:
+    qc.append(O_Good_gate, R + [a])
+    qc.p(beta, a)
+    qc.append(O_Good_gate, R + [a])
+
+
+# ---------------------------------------------------------------------------
+# Main entry point.
 # ---------------------------------------------------------------------------
 def YLC_amplifier(
-    initial_state: Statevector,
-    lambda_lower: float,
     state_prep: tuple[QuantumCircuit, QuantumCircuit],
-    SA_reflection: Callable[[float], QuantumCircuit],
+    O_Good: QuantumCircuit,
+    lam: float,
     delta: float = 1e-2,
-    sanity_check: bool = True,
-) -> tuple[Statevector, QuantumCircuit]:
+) -> tuple[Statevector, QuantumCircuit, QuantumCircuit]:
     """
     Yoder-Low-Chuang fixed-point amplitude amplification.
 
-    Inputs
-    ------
-    initial_state : Statevector
-        The pre-amplification state |Phi> = alpha|Good> + beta|Bad>.
-        Only used for an (optional) sanity check that A|0> == |Phi>; the
-        amplification itself re-derives the state from `state_prep`.
-    lambda_lower  : float in (0, 1]
-        A lower bound on |alpha|.  The amplifier guarantees success for
-        every true alpha with |alpha| >= lambda_lower.
-    state_prep    : (A, A_inverse)
-        Two QuantumCircuits on the same n qubits, with  A|0...0> = |Phi>
-        and  A_inverse = A^dagger.  Only `A` is used in this version (for
-        the one-time initial state preparation); `A_inverse` is accepted
-        for interface compatibility with downstream modules.
-    SA_reflection  : phi -> QuantumCircuit
-        A *function* that, given a phase angle phi, returns a circuit
-        implementing the reflection-with-phase about the prepared state,
-            S_A(phi) = I - (1 - e^{i phi}) * A|0><0|A^dagger,
-        on the same n qubits as A. 
-    delta         : float in (0, 1), default 1e-2
-        Target failure amplitude.  After amplification,
-            |<Bad | amplified_state>| <= delta.
+    Parameters
+    ----------
+    state_prep : (A, A_inverse)
+        A is an n-qubit QuantumCircuit with  A|0...0> = |Phi> = g|Good> + b|Bad>.
+        A_inverse must equal A^dagger.
+    O_Good : QuantumCircuit on n+1 qubits
+        Convention: qubits 0..n-1 are the state register R, qubit n is the
+        1-qubit Good-indicator ancilla a.  Acts as
+            |Good>_R |b>_a -> |Good>_R |b XOR 1>_a
+            |Bad>_R  |b>_a -> |Bad>_R  |b>_a
+    lam : float in (0, 1]
+        A known lower bound on the success probability g^2.
+    delta : float in (0, 1)
+        Target failure amplitude on |Bad> after amplification.
 
     Returns
     -------
-    amplified_state : Statevector
-        The state after applying the full YLC circuit to |0...0>.
-    circuit         : QuantumCircuit
-        The circuit itself; circuit . |0...0> == amplified_state.
+    psi : Statevector on n+1 qubits
+        The amplified joint state  S_L . (A tensor I_anc) . |0...0>_R |0>_a.
+        With ancilla in |0>, the Good-component on R has amplitude  >= sqrt(1-delta^2).
+    S_L : QuantumCircuit on n+1 qubits
+        The l-fold YLC iterate  G(alpha_l, beta_l) ... G(alpha_1, beta_1)
+        as a standalone circuit (does NOT include the initial A).
+    S_L_inv : QuantumCircuit on n+1 qubits
+        The Hermitian conjugate of S_L, ready for use in downstream modules
+        (e.g. amplitude estimation, phase estimation, uncomputation steps).
     """
     A, A_inv = state_prep
-    n_qubits = A.num_qubits
+    n = A.num_qubits
 
-    if A_inv.num_qubits != n_qubits:
+    if A_inv.num_qubits != n:
         raise ValueError("A and A_inverse must act on the same number of qubits.")
-    if not (0.0 < lambda_lower <= 1.0):
-        raise ValueError("lambda_lower must lie in (0, 1].")
+    if O_Good.num_qubits != n + 1:
+        raise ValueError(f"O_Good must act on n+1 = {n+1} qubits, got {O_Good.num_qubits}.")
+    if not (0.0 < lam <= 1.0):
+        raise ValueError("lam (lower bound on g^2) must lie in (0, 1].")
     if not (0.0 < delta < 1.0):
         raise ValueError("delta must lie in (0, 1).")
 
-    if sanity_check:
-        prepared = Statevector.from_label("0" * n_qubits).evolve(A)
-        if not prepared.equiv(initial_state):
-            raise ValueError("state_prep[0] applied to |0...0> does not match initial_state.")
-
     # ------------------------------------------------------------------
-    # 1. Pick L: smallest odd integer with  L >= log(2/delta) / (2 arcsin(lambda)).
+    # Iteration count:  smallest odd L > log(2/delta) / sqrt(lam).
     # ------------------------------------------------------------------
-    L_real = math.log(2.0 / delta) / (2.0 * math.asin(lambda_lower))
-    L = max(1, math.ceil(L_real))
+    L_real = math.log(2.0 / delta) / math.sqrt(lam)
+    L = math.floor(L_real) + 1                            # smallest integer > L_real
     if L % 2 == 0:
-        L += 1
+        L += 1                                            # promote to odd
+    l = (L - 1) // 2
 
     # ------------------------------------------------------------------
-    # 2. Phase schedule.
+    # Phase schedule.
     # ------------------------------------------------------------------
     alphas, betas = _ylc_phase_schedule(L, delta)
 
     # ------------------------------------------------------------------
-    # 3. Build the circuit:  G_L ... G_1 . A . |0...0>
-    #    with  G_j = - S_A(beta_j) . S_0(alpha_j).
+    # Build S_L = G(alpha_l, beta_l) ... G(alpha_1, beta_1)
     #
-    #    Compared to textbook YLC, the outer reflection A . S_0(beta_j) . A^dagger
-    #    is replaced by the user-provided S_A(beta_j); we no longer apply A
-    #    and A^dagger inside the loop, so A_inv is unused here. 
+    # Qubit layout in S_L:
+    #     qubits 0 .. n-1  : state register R
+    #     qubit  n         : Good-indicator ancilla a
     # ------------------------------------------------------------------
-    A_gate = A.to_gate(label="A")
-    _ = A_inv                                    # retained in the API; unused here
+    R = list(range(n))
+    a = n
 
-    circ = QuantumCircuit(n_qubits, name=f"YLC(L={L})")
-    circ.append(A_gate, range(n_qubits))         # initial state prep: |Phi> = A|0>
+    A_gate      = A.to_gate(label="A")
+    A_inv_gate  = A_inv.to_gate(label="A†")
+    O_Good_gate = O_Good.to_gate(label="O_G")
 
-    for j in range(L):
-        s0 = _S0_reflection(n_qubits, alphas[j]).to_gate(label=f"S_0(alpha_{j+1})")
-        sa = SA_reflection(betas[j]).to_gate(label=f"S_A(beta_{j+1})")
-        circ.append(s0, range(n_qubits))         # inner: S_0 
-        circ.append(sa, range(n_qubits))         # outer: user-supplied S_A
+    S_L = QuantumCircuit(n + 1, name=f"S_L(l={l})")
+    for j in range(l):                          # j = 0..l-1  ↔  spec's 1..l
+        # G_j = - S_s(alpha_j) . S_t(beta_j)    (leading - is a global phase)
+        # Right-to-left in the operator product = first-to-last in gate order:
+        _apply_St(S_L, betas[j], R, a, O_Good_gate)
+        _apply_Ss(S_L, alphas[j], R, A_gate, A_inv_gate)
 
     # ------------------------------------------------------------------
-    # 4. Apply circ to |0...0> to get the final state.
+    # Hermitian conjugate as a separate circuit.
     # ------------------------------------------------------------------
-    amplified_state = Statevector.from_label("0" * n_qubits).evolve(circ)
-    return amplified_state, circ
+    S_L_inv = S_L.inverse()
+    S_L_inv.name = f"S_L_inv(l={l})"
+
+    # ------------------------------------------------------------------
+    # Compute the amplified state by simulating  S_L . A|0>_R |0>_a.
+    # ------------------------------------------------------------------
+    prep_circ = QuantumCircuit(n + 1, name="prep")
+    prep_circ.append(A_gate, R)
+    full = prep_circ.compose(S_L)
+
+    psi = Statevector.from_label("0" * (n + 1)).evolve(full)
+    return psi, S_L, S_L_inv
 
 
 # ---------------------------------------------------------------------------
-# Self-test: amplify a tiny single-qubit example.
-#   |Phi> = sin(theta)|1> + cos(theta)|0>.
-#   A = R_y(2*theta); A^dagger = R_y(-2*theta).
-#   S_A(phi) is built directly as A . S_0(phi) . A^dagger so the test mimics
-#   "the user has an efficient S_A oracle" without secretly relying on YLC's
-#   internal construction.
-#
-# Note: with |Good> identified as |0...0>, we have alpha = <0|Phi> = cos(theta),
-# so the initial success amplitude is cos(theta), not sin(theta).
+# Self-test
+#   n = 1; A = R_y(2 theta).  Good = |1>, so O_Good = CNOT(R -> ancilla).
+#   g = sin(theta).
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    theta = 1.30                                 # cos(1.30) ~ 0.2675 = true alpha
-    lam   = 0.25                                 # known lower bound
-    delta = 1e-3
+    theta = 0.30                                     # g = sin(0.30) ~= 0.2955
+    g_true = math.sin(theta)
+    lam = 0.05                                       # we only know g^2 >= 0.05
+    delta = 0.05
 
-    A = QuantumCircuit(1, name="A");      A.ry(2 * theta, 0)
-    A_inv = QuantumCircuit(1, name="A^dagger"); A_inv.ry(-2 * theta, 0)
+    A     = QuantumCircuit(1, name="A");  A.ry(2.0 * theta, 0)
+    A_inv = QuantumCircuit(1, name="A†"); A_inv.ry(-2.0 * theta, 0)
 
-    def SA_reflection(phi: float) -> QuantumCircuit:
-        """User-provided S_A(phi) = A . S_0(phi) . A^dagger on 1 qubit."""
-        qc = QuantumCircuit(1, name=f"S_A({phi:.3f})")
-        qc.compose(A_inv, qubits=[0], inplace=True)
-        qc.x(0); qc.p(phi, 0); qc.x(0)           # this is S_0(phi) on 1 qubit
-        qc.compose(A, qubits=[0], inplace=True)
-        return qc
+    O_Good = QuantumCircuit(2, name="O_Good")
+    O_Good.cx(0, 1)                                  # ancilla XOR= (R == |1>)
 
-    phi0 = Statevector.from_label("0").evolve(A)
-    final, circ = YLC_amplifier(phi0, lam, (A, A_inv), SA_reflection, delta=delta)
+    psi, S_L, S_L_inv = YLC_amplifier((A, A_inv), O_Good, lam, delta)
 
-    p_good = abs(final.data[0]) ** 2             
-    print(f"depth of YLC circuit:   {circ.decompose().depth()}")
-    print(f"initial P(Good):        {math.cos(theta) ** 2:.6f}")
-    print(f"amplified P(Good):      {p_good:.6f}")
-    print(f"target 1 - delta^2:     {1 - delta ** 2:.6f}")
-    print("OK" if p_good >= 1 - delta ** 2 else "BELOW TARGET")
+    # |Good>_R |0>_a  =  |q1=0, q0=1>  in Qiskit little-endian → index 1
+    p_good = abs(psi.data[1]) ** 2
+    print(f"true g^2 (initial P(Good)): {g_true ** 2:.6f}")
+    print(f"after amplification:        {p_good:.6f}")
+    print(f"target 1 - delta^2:         {1.0 - delta ** 2:.6f}")
+    print(f"S_L depth (decomposed):     {S_L.decompose().depth()}")
+    print("OK" if p_good >= 1.0 - delta ** 2 else "BELOW TARGET")
+    # print(dumps(S_L.decompose()))
